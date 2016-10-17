@@ -1,15 +1,9 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
 using System.Text.RegularExpressions;
-using Newtonsoft.Json;
 using Octopus.Client;
 using Octopus.Client.Editors;
-using Octopus.Client.Editors.DeploymentProcess;
 using Octopus.Client.Model;
-using Octopus.Client.Model.Endpoints;
 using Octopus.TenantMigrator.Infrastructure;
 using Octopus.TenantMigrator.Integration;
 using Serilog;
@@ -19,21 +13,17 @@ namespace Octopus.TenantMigrator.Commands
     [Command("migrate", Description = "Migrates environments pretending to be tenants into real-life tenants in Octopus.")]
     public class MigrateCommand : ApiCommand
     {
-        private const int DefaultNumberOfProjects = 20;
-        private const int DefaultNumberOfCustomers = 50;
-        private const int DefaultNumberOfTesters = 10;
-
         private static readonly ILogger Log = Serilog.Log.ForContext<MigrateCommand>();
 
-        private string Include = null;
-        private string Exclude = null;
+        private string include;
+        private string exclude;
 
         public MigrateCommand(IOctopusRepositoryFactory octopusRepositoryFactory)
             : base(octopusRepositoryFactory)
         {
             var options = Options.For("Multi-tenant sample");
-            options.Add("include=", $"[Optional] Include environments where the name matches this regex. Default is to migrate all environments.", v => Include = v);
-            options.Add("exclude=", $"[Optional] Exclude environments where the name matches this regex. Default is to migrate all environments.", v => Exclude = v);
+            options.Add("include=", "[Optional] Include environments where the name matches this regex. Default is to migrate all environments.", v => include = v);
+            options.Add("exclude=", "[Optional] Exclude environments where the name matches this regex. Default is to migrate all environments.", v => exclude = v);
         }
 
         protected override void Execute()
@@ -49,188 +39,52 @@ namespace Octopus.TenantMigrator.Commands
             // In this case we are building environments based on a naming convention where the Source Environments are named like "{TenantName} - {EnvironmentName}".
             // For example, "Customer 1 - Staging" and "Customer 1 - Production" would indicate there is a Tenant called "Customer 1" that will target two environments called "Staging" and "Production" respectively.
             // In your situation you may want to create a static set of environments... or something similar.
-            var targetEnvironments = SetUpTargetEnvironments(environmentsToMigrate);
+            var environmentMap = SetUpEnvironments(environmentsToMigrate);
 
             // Step X: Inject the target environments into the appropriate Lifecycle Phases
-            InjectTargetEnvironmentsIntoLifecycles(environmentsToMigrate, targetEnvironments);
+            InjectTargetEnvironmentsIntoLifecycles(environmentMap);
 
             // Step 3: Make sure all of our tags are configured correctly
             // In your situation you may want different tags - these are just some ideas from our samples
             // For more information see http://g.octopushq.com/MultiTenantTags
             var allTags = SetUpTags();
-            var getTag = new Func<string, TagResource>(name => allTags.FirstOrDefault(t => t.Name == name));
+            var getTag = new Func<string, TagResource>(name => allTags.FirstOrDefault(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)));
 
-            // Step 4: Set up library variable templates and values
+            // Step X: Set up the tenants, and tag them using some kind of convention
+            var tenantEnvironmentMap = CreateTenantsFromEnvironments(environmentsToMigrate);
+
+            // Step X: Set up library variable templates and values
             // In your situation you will certainly need different variable templates and values! These examples show you how to set up your own.
             // For more information see http://g.octopushq.com/MultiTenantVariables
-            var libraryVariableSets = SetUpLibraryVariableSets();
-            
-            // Step X: Set up the tenants, and tag them using some kind of convention
-            var tenantEnvironmentMap = CreateTenantsFromEnvironments(environmentsToMigrate, getTag);
+            var libraryVariableSets = SetUpCommonVariableTemplates();
 
             // Step X: Connect each tenant to the correct projects and environments.
             // In this example we will find projects connected to the source environments via Lifecycle, and connect the resulting tenants to those projects.
             // This will have the same end-result as the original "environments pretending to be tenants" approach.
             var allProjects = Repository.Projects.GetAll().ToArray();
-            ConnectTenantsToProjectsAndEnvironments(tenantEnvironmentMap, allProjects, targetEnvironments);
+            ConnectTenantsToProjectsAndEnvironments(allProjects, tenantEnvironmentMap, environmentMap);
 
-            // Step X: Set up dedicated hosting for tenants using any deployment targets belonging to the "environment pretending to be a tenant" environment
+            // Step X: Set up hosting for tenants using any deployment targets belonging to the "environment pretending to be a tenant" environment
+            // This will allocate tenants directly to deployment targets
             // For more information see http://g.octopushq.com/MultiTenantHostingModel
-            foreach (var customer in customers.Where(c => c.IsVIP()))
+            var allDeploymentTargets = Repository.Machines.FindAll();
+            foreach (var target in allDeploymentTargets)
             {
-                Log.Information("Setting up dedicated hosting for {VIP}...", customer.Name);
-                var dedicatedHosts = Enumerable.Range(0, 2).Select(i => Repository.Machines.CreateOrModify(
-                    $"{customer.Name} Host {i}",
-                    new CloudRegionEndpointResource(),
-                    GetEnvironmentsForCustomer(allEnvironments, customer),
-                    new[] {"web-server"},
-                    new[] {customer},
-                    new TagResource[0]))
-                    .ToArray();
+                var matchingSourceEnvironments =
+                    environmentsToMigrate.Where(e => target.EnvironmentIds.Contains(e.Id))
+                        .ToArray();
+
+                var matchingTargetEnvironments =
+                    environmentMap.GetTargetEnvironmentsForSources(matchingSourceEnvironments)
+                        .ToArray();
+
+                target.AddOrUpdateEnvironments(matchingTargetEnvironments);
+
+                var matchingTenants = tenantEnvironmentMap.GetTenantsForSourceEnvironments(matchingSourceEnvironments);
+                target.AddOrUpdateTenants(matchingTenants);
+
+                Repository.Machines.Modify(target);
             }
-
-            Log.Information("Building {Count} sample projects...", NumberOfProjects);
-            var projects = Enumerable.Range(0, NumberOfProjects)
-                .Select(i => new { Name = ProjectNames[i], Alias = ProjectNames[i].ToLowerInvariant() })
-                .Select((x, i) =>
-                {
-                    Log.Information("Setting up project {ProjectName}...", x.Name);
-                    var projectEditor = Repository.Projects.CreateOrModify(x.Name, projectGroup, normalLifecycle, LipsumTheRaven.GenerateLipsum(2))
-                    .SetLogo(SampleImageCache.GetRobotImage(x.Name))
-                        .IncludingLibraryVariableSets(libraryVariableSets);
-
-                    projectEditor.VariableTemplates
-                        .Clear()
-                        .AddOrUpdateSingleLineTextTemplate("Tenant.Database.Name", "Database name", $"{x.Alias}-#{{Environment.Alias}}-#{{Tenant.Alias}}", $"The environment-specific name of the {x.Name} database for this tenant.")
-                        .AddOrUpdateSingleLineTextTemplate("Tenant.Database.UserID", "Database username", $"{x.Alias}-#{{Environment.Alias}}-#{{Tenant.Alias}}", "The User ID used to connect to the tenant database.")
-                        .AddOrUpdateSensitiveTemplate(VariableKeys.ProjectTenantVariables.TenantDatabasePassword, "Database password", defaultValue: null, helpText: "The password used to connect to the tenant database.")
-                        .AddOrUpdateSingleLineTextTemplate("Tenant.Domain.Name", "Domain name", $"#{{Tenant.Alias}}.{x.Alias}.com", $"The environment-specific domain name for the {x.Name} web application for this tenant.");
-
-                    projectEditor.Variables
-                        .AddOrUpdateVariableValue("DatabaseConnectionString", $"Server=db.{x.Alias}.com;Database=#{{Tenant.Database.Name}};User ID=#{{Tenant.Database.UserID}};Password=#{{Tenant.Database.Password}};")
-                        .AddOrUpdateVariableValue("HostURL", "https://#{Tenant.Domain.Name}");
-
-                    // Create the channels for the sample project
-                    projectEditor.Channels.CreateOrModify("1.x Normal", "The channel for stable releases that will be deployed to our production customers.")
-                        .SetAsDefaultChannel()
-                        .RestrictToTenants(getTag("Tester"), getTag("Early adopter"), getTag("Stable"))
-                        .Save();
-                    var betaChannelEditor = projectEditor.Channels.CreateOrModify("2.x Beta", "The channel for beta releases that will be deployed to our beta customers.")
-                        .UsingLifecycle(betaLifecycle)
-                        .RestrictToTenants(getTag("2.x Beta"));
-
-                    // Delete the "default channel" if it exists
-                    projectEditor.Channels.Delete("Default");
-
-                    // Rebuild the process from scratch
-                    projectEditor.DeploymentProcess.ClearSteps();
-
-                    projectEditor.DeploymentProcess.AddOrUpdateStep("Deploy Application")
-                        .TargetingRoles("web-server")
-                        .AddOrUpdateScriptAction("Deploy Application", new InlineScriptFromFileInAssembly("MultiTenantSample.Deploy.ps1"), ScriptTarget.Target);
-
-                    projectEditor.DeploymentProcess.AddOrUpdateStep("Deploy 2.x Beta Component")
-                        .TargetingRoles("web-server")
-                        .AddOrUpdateScriptAction("Deploy 2.x Beta Component", new InlineScriptFromFileInAssembly("MultiTenantSample.DeployBetaComponent.ps1"), ScriptTarget.Target)
-                        .ForChannels(betaChannelEditor.Instance);
-
-                    projectEditor.DeploymentProcess.AddOrUpdateStep("Notify VIP Contact")
-                        .AddOrUpdateScriptAction("Notify VIP Contact", new InlineScriptFromFileInAssembly("MultiTenantSample.NotifyContact.ps1"), ScriptTarget.Server)
-                        .ForTenantTags(getTag("VIP"));
-
-                    projectEditor.Save();
-
-                    return projectEditor.Instance;
-                })
-            .ToArray();
-
-            Log.Information("Created {CustomerCount} customers and {TesterCount} testers and {ProjectCount} projects.",
-                customers.Length, testers.Length, projects.Length);
-            Log.Information("Customer tagging conventions: Names with 'v' will become 'VIP' (with dedicated hosting), names with 'u' will become 'Trial', names with 'e' will become 'Early adopter', everyone else will be 'Standard' and assigned to a random shared server pool.");
-        }
-
-        private void InjectTargetEnvironmentsIntoLifecycles(EnvironmentResource[] sourceEnvironments, EnvironmentResource[] targetEnvironments)
-        {
-            // Where we find a source environment, we should add the resulting target environment to the same Lifecycle Phase
-            var allLifecycles = Repository.Lifecycles.FindAll();
-            foreach (var lifecycle in allLifecycles)
-            {
-                foreach (var phase in lifecycle.Phases)
-                {
-                    var autoSourceEnvironments =
-                        sourceEnvironments.Where(source => phase.AutomaticDeploymentTargets
-                            .Any(id => string.Equals(id, source.Id, StringComparison.OrdinalIgnoreCase)))
-                            .ToArray();
-
-                    var autoTargetEnvironmentNames =
-                        autoSourceEnvironments.Select(GetTargetEnvironmentNameFromSourceEnvironment).Distinct();
-                    var autoTargetEnvironments =
-                        targetEnvironments.Where(target => autoTargetEnvironmentNames.Contains(target.Name, StringComparer.OrdinalIgnoreCase));
-                        
-                    foreach (var autoTarget in autoTargetEnvironments)
-                    {
-                        phase.WithAutomaticDeploymentTargets(autoTarget);
-                    }
-
-                    var optionalSourceEnvironments =
-                        sourceEnvironments.Where(source => phase.AutomaticDeploymentTargets
-                            .Any(id => string.Equals(id, source.Id, StringComparison.OrdinalIgnoreCase)))
-                            .ToArray();
-
-                    var optionalTargetEnvironmentNames =
-                        optionalSourceEnvironments.Select(GetTargetEnvironmentNameFromSourceEnvironment).Distinct();
-                    var optionalTargetEnvironments =
-                        targetEnvironments.Where(target => optionalTargetEnvironmentNames.Contains(target.Name, StringComparer.OrdinalIgnoreCase));
-
-                    foreach (var optionalTarget in optionalTargetEnvironments)
-                    {
-                        phase.WithAutomaticDeploymentTargets(optionalTarget);
-                    }
-                }
-
-                Repository.Lifecycles.Modify(lifecycle);
-            }
-        }
-
-        private void ConnectTenantsToProjectsAndEnvironments(
-            Dictionary<TenantEditor, EnvironmentResource[]> tenantEnvironmentMap,
-            ProjectResource[] allProjects,
-            EnvironmentResource[] targetEnvironments)
-        {
-            var allChannels = Repository.Channels.FindAll();
-            var allLifecycles = Repository.Lifecycles.FindAll();
-            foreach (var project in allProjects)
-            {
-                var channels = allChannels.Where(c => c.ProjectId == project.Id).ToArray();
-                var connectedLifecycleIds =
-                    new[] {project.LifecycleId}.Concat(channels.Select(c => c.LifecycleId).Where(id => id != null))
-                        .Distinct().ToArray();
-                var connectedLifecycles = allLifecycles.Where(l => connectedLifecycleIds.Contains(l.Id)).ToArray();
-
-                foreach (var tenantMap in tenantEnvironmentMap)
-                {
-                    if (connectedLifecycles.Any(l => LifecycleContainsAnyOfTheseEnvironments(l, tenantMap.Value)))
-                    {
-                        var targets = targetEnvironments.Where(e => connectedLifecycles.Any(l => LifecycleContainsAnyOfTheseEnvironments(l, e))).ToArray();
-                        Log.Information("Connecting {Tenant} to {Project} deploying to {Environments}",
-                            tenantMap.Key.Instance.Name, project, targets.Select(e => e.Name));
-                        tenantMap.Key.ConnectToProjectAndEnvironments(project, targets);
-                    }
-                }
-            }
-
-            // Save all of the tenants now we've connected them to the project/environment combinations
-            foreach (var tenantMap in tenantEnvironmentMap)
-            {
-                tenantMap.Key.Save();
-            }
-        }
-
-        public bool LifecycleContainsAnyOfTheseEnvironments(LifecycleResource lifecycle, params EnvironmentResource[] environments)
-        {
-            return lifecycle.Phases.Any(p =>
-                p.AutomaticDeploymentTargets.Intersect(environments.Select(e => e.Id)).Any() ||
-                p.OptionalDeploymentTargets.Intersect(environments.Select(e => e.Id)).Any());
         }
 
         void EnsureMultitenancyFeature()
@@ -246,17 +100,17 @@ namespace Octopus.TenantMigrator.Commands
         {
             EnvironmentResource[] environmentsToMigrate;
             var allEnvironments = Repository.Environments.GetAll();
-            if (Include == null && Exclude == null)
+            if (include == null && exclude == null)
             {
                 Log.Information("Migrating ALL environments...");
                 environmentsToMigrate = allEnvironments.ToArray();
             }
             else
             {
-                Log.Information($"Migrating matching environments: Include='{Include}' Exclude='{Exclude}'");
-                var includeRegex = new Regex(Include ?? ".*",
+                Log.Information($"Migrating matching environments: Include='{include}' Exclude='{exclude}'");
+                var includeRegex = new Regex(include ?? ".*",
                     RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
-                var excludeRegex = new Regex(Exclude ?? "^$",
+                var excludeRegex = new Regex(exclude ?? "^$",
                     RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
 
                 environmentsToMigrate =
@@ -266,11 +120,19 @@ namespace Octopus.TenantMigrator.Commands
             return environmentsToMigrate;
         }
 
-        private EnvironmentResource[] SetUpTargetEnvironments(EnvironmentResource[] environmentsToMigrate)
+        private SourceToTargetEnvironmentMap SetUpEnvironments(EnvironmentResource[] environmentsToMigrate)
         {
-            var targetEnvironmentNames = environmentsToMigrate.Select(GetTargetEnvironmentNameFromSourceEnvironment).Distinct().OrderBy(x => x).ToArray();
-            Log.Information("Setting up target environments {Environments}...", targetEnvironmentNames);
-            return targetEnvironmentNames.Select(name => Repository.Environments.CreateOrModify(name).Instance).ToArray();
+            var existingEnvironments = Repository.Environments.GetAll().ToArray();
+            var preEnvironmentMap = new SourceToTargetEnvironmentMap(environmentsToMigrate, existingEnvironments);
+            if (!preEnvironmentMap.MissingTargetEnvironmentNames.Any())
+            {
+                Log.Information("All target environments already exist!");
+                return preEnvironmentMap;
+            }
+
+            Log.Information("Setting up target environments {Environments}...", preEnvironmentMap.MissingTargetEnvironmentNames);
+            var newEnvironments = preEnvironmentMap.MissingTargetEnvironmentNames.Select(name => Repository.Environments.CreateOrModify(name).Instance).ToArray();
+            return new SourceToTargetEnvironmentMap(environmentsToMigrate, existingEnvironments.Concat(newEnvironments).ToArray());
         }
 
         private TagResource[] SetUpTags()
@@ -316,7 +178,7 @@ namespace Octopus.TenantMigrator.Commands
             return allTags;
         }
 
-        private LibraryVariableSetResource[] SetUpLibraryVariableSets()
+        private LibraryVariableSetResource[] SetUpCommonVariableTemplates()
         {
             var stdTenantVarEditor = Repository.LibraryVariableSets.CreateOrModify(
                 "Standard tenant details",
@@ -334,41 +196,323 @@ namespace Octopus.TenantMigrator.Commands
             return new[] {stdTenantVarEditor.Instance};
         }
 
-        private Dictionary<TenantEditor, EnvironmentResource[]> CreateTenantsFromEnvironments(EnvironmentResource[] environmentsToMigrate, Func<string, TagResource> getTag)
+        private MigrateCommand.SourceEnvironmentToTenantMap CreateTenantsFromEnvironments(EnvironmentResource[] environmentsToMigrate)
         {
             // This method will build tenants based on a naming convention "{TenantName} - {TargetEnvironment}".
             // This is one way you could group multiple source environments into a single tenant with multiple target environments.
-            var customerMap = environmentsToMigrate
-                .Select(e => new { SourceEnvironment = e, TenantName = GetTenantNameFromSourceEnvironment(e), TargetEnvironmentName = GetTargetEnvironmentNameFromSourceEnvironment(e) })
-                .GroupBy(x => x.TenantName)
-                .Select(g =>
+            var allTenants = Repository.Tenants.GetAll().ToArray();
+            var preTenantMap = new MigrateCommand.SourceEnvironmentToTenantMap(environmentsToMigrate, allTenants);
+            if (!preTenantMap.MissingTenantNames.Any())
+            {
+                Log.Information("All of the required tenants already exist!");
+                return preTenantMap;
+            }
+
+            var newTenants = preTenantMap.MissingTenantNames
+                .Select(name => new { TenantName = name, SourceEnvironments = preTenantMap.GetSourceEnvironmentsForTenantNames(name)})
+                .Select(x =>
                 {
-                    Log.Information("Setting up tenant {TenantName} based on the environment(s) {SourceEnvironments}...", g.Key, g.Select(x => x.SourceEnvironment.Name));
-                    var tenantEditor = Repository.Tenants.CreateOrModify(g.Key);
-                    TenantResource tenant = tenantEditor.Instance;
+                    Log.Information("Setting up tenant {TenantName} based on the environment(s) {SourceEnvironments}...", x.TenantName, x.SourceEnvironments.Select(e => e.Name));
+                    var tenantEditor = Repository.Tenants.CreateOrModify(x.TenantName);
+                    
+                    // TODO: Move all the thingS!
+                    //TenantResource tenant = tenantEditor.Instance;
 
-                    // You will likely have another way of tagging your tenants, this is here as an example of how you could tag tenants.
-                    var isVIP = new Func<TenantResource, bool>(t => t.Name.ToLowerInvariant().Contains("v"));
-                    var isEarlyAdopter = new Func<TenantResource, bool>(t => t.Name.ToLowerInvariant().Contains("e"));
-                    tenant.WithTag(getTag("External"));
-                    tenant.WithTag(isVIP(tenant) ? getTag("VIP") : getTag("Standard"));
-                    tenant.WithTag(isEarlyAdopter(tenant) ? getTag("Early adopter") : getTag("Stable"));
+                    //// You will likely have another way of tagging your tenants, this is here as an example of how you could tag tenants.
+                    //var isVIP = new Func<TenantResource, bool>(t => t.Name.ToLowerInvariant().Contains("v"));
+                    //var isEarlyAdopter = new Func<TenantResource, bool>(t => t.Name.ToLowerInvariant().Contains("e"));
+                    //tenant.WithTag(getTag("External"));
+                    //tenant.WithTag(isVIP(tenant) ? getTag("VIP") : getTag("Standard"));
+                    //tenant.WithTag(isEarlyAdopter(tenant) ? getTag("Early adopter") : getTag("Stable"));
 
-                    return new { TenantEditor = tenantEditor.Save(), SourceEnvironments = g.Select(x => x.SourceEnvironment).ToArray() };
-                })
-                .ToDictionary(x => x.TenantEditor, x => x.SourceEnvironments);
-            return customerMap;
+                    return tenantEditor.Save().Instance;
+                }).ToArray();
+
+            return new MigrateCommand.SourceEnvironmentToTenantMap(environmentsToMigrate, allTenants.Concat(newTenants).ToArray());
         }
 
-        private static string GetTenantNameFromSourceEnvironment(EnvironmentResource source)
+        private void InjectTargetEnvironmentsIntoLifecycles(MigrateCommand.SourceToTargetEnvironmentMap sourceToTargetEnvironmentMap)
         {
-            return source.Name.Split(new[] { '-' }, 2)[0].Trim();
+            // Where we find a source environment, we should add the resulting target environment to the same Lifecycle Phase
+            var allLifecycles = Repository.Lifecycles.FindAll();
+            foreach (var lifecycle in allLifecycles)
+            {
+                foreach (var phase in lifecycle.Phases)
+                {
+                    phase.WithAutomaticDeploymentTargets(sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSourceIds(phase.AutomaticDeploymentTargets.ToArray()));
+                    phase.WithOptionalDeploymentTargets(sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSourceIds(phase.OptionalDeploymentTargets.ToArray()));
+                }
+
+                Repository.Lifecycles.Modify(lifecycle);
+            }
         }
 
-        private static string GetTargetEnvironmentNameFromSourceEnvironment(EnvironmentResource source)
+        private void ConnectTenantsToProjectsAndEnvironments(
+            ProjectResource[] allProjects, SourceEnvironmentToTenantMap sourceEnvironmentToTenantEnvironmentMap, SourceToTargetEnvironmentMap sourceToTargetEnvironmentMap)
         {
-            var split = source.Name.Split(new[] { '-' }, 2);
-            return split.Length == 2 ? split[1].Trim() : "Production";
+            var allChannels = Repository.Channels.FindAll();
+            var allLifecycles = Repository.Lifecycles.FindAll();
+            var tenants = Repository.Tenants.Get(sourceEnvironmentToTenantEnvironmentMap.TenantIds);
+            foreach (var project in allProjects)
+            {
+                var projectChannels = allChannels.Where(c => c.ProjectId == project.Id);
+                var projectChannelLifecycleIds = projectChannels.Select(c => c.LifecycleId).Where(id => id != null);
+                var connectedLifecycleIds = new[] { project.LifecycleId }.Concat(projectChannelLifecycleIds).Distinct().ToArray();
+                var connectedLifecycles = allLifecycles.Where(l => connectedLifecycleIds.Contains(l.Id)).ToArray();
+
+                foreach (var tenant in tenants)
+                {
+                    // Figure out if any "environments pretending to be this tenant" were connected to this project
+                    var connectedSourceEnvironmentsForTenant = sourceEnvironmentToTenantEnvironmentMap.GetSourceEnvironmentsForTenants(tenant)
+                        .Where(source => connectedLifecycles.Any(l => LifecycleContainsAnyOfTheseEnvironments(l, source)))
+                        .ToArray();
+
+                    if (connectedSourceEnvironmentsForTenant.Any())
+                    {
+                        var targetEnvironmentsForTenant = sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSources(connectedSourceEnvironmentsForTenant);
+                        Log.Information("Connecting {Tenant} to {Project} deploying to {Environments}",
+                            tenant.Name, project.Name, targetEnvironmentsForTenant.Select(e => e.Name));
+                        tenant.ConnectToProjectAndEnvironments(project, targetEnvironmentsForTenant);
+                    }
+                }
+            }
+
+            // Ensure each tenanted project is configured for tenanted deployments
+            // NOTE: Do this before attempting to connect tenants to avoid validation issues
+            var tenantedProjects = allProjects.Where(p => tenants.SelectMany(t => t.ProjectEnvironments.Select(pe => pe.Key)).Contains(p.Id)).ToArray();
+            foreach (var tenantedProject in tenantedProjects)
+            {
+                if (tenantedProject.TenantedDeploymentMode == ProjectTenantedDeploymentMode.Untenanted)
+                {
+                    tenantedProject.TenantedDeploymentMode = ProjectTenantedDeploymentMode.TenantedOrUntenanted;
+                    Log.Information("Changing {Project} TenantedDeploymentMode to {Mode}", tenantedProject.Name, tenantedProject.TenantedDeploymentMode);
+                    Repository.Projects.Modify(tenantedProject);
+                }
+            }
+
+            // Save all of the tenants now we've connected them to the project/environment combinations
+            foreach (var tenant in tenants)
+            {
+                Repository.Tenants.Modify(tenant);
+            }
+        }
+
+        class SourceToTargetEnvironmentMap
+        {
+            private readonly SourceAndTargetEnvironment[] sourcesAndTargets;
+
+            class SourceAndTargetEnvironment
+            {
+                public EnvironmentResource Source { get; }
+                public EnvironmentResource Target { get; }
+
+                public SourceAndTargetEnvironment(EnvironmentResource source, EnvironmentResource target)
+                {
+                    Source = source;
+                    Target = target;
+                }
+            }
+
+            public SourceToTargetEnvironmentMap(EnvironmentResource[] environmentsToMigrate, EnvironmentResource[] existingEnvironments)
+            {
+                var expectedTargetEnvironmentNames =
+                    environmentsToMigrate.Select(Conventions.BuildTargetEnvironmentNameFromSourceEnvironment)
+                        .Distinct()
+                        .OrderBy(name => name)
+                        .ToArray();
+                var targetEnvironments = existingEnvironments.Where(
+                    e => expectedTargetEnvironmentNames.Contains(e.Name, StringComparer.OrdinalIgnoreCase))
+                    .ToArray();
+                MissingTargetEnvironmentNames =
+                    expectedTargetEnvironmentNames.Except(targetEnvironments.Select(e => e.Name)).ToArray();
+
+                if (!MissingTargetEnvironmentNames.Any())
+                {
+                    sourcesAndTargets = environmentsToMigrate
+                        .Select(source => new SourceAndTargetEnvironment(source, targetEnvironments.FirstOrDefault(target => string.Equals(target.Name, Conventions.BuildTargetEnvironmentNameFromSourceEnvironment(source), StringComparison.OrdinalIgnoreCase))))
+                        .ToArray();
+                }
+            }
+
+            public string[] MissingTargetEnvironmentNames { get; }
+
+            public EnvironmentResource[] GetTargetEnvironmentsForSources(params EnvironmentResource[] sources)
+            {
+                return GetTargetEnvironmentsForSourceIds(sources.Select(e => e.Id).ToArray());
+            }
+
+            public EnvironmentResource[] GetTargetEnvironmentsForSourceIds(params string[] sourceEnvironmentIds)
+            {
+                AssertNoMissingEnvironments();
+                return sourcesAndTargets.Where(x => sourceEnvironmentIds.Contains(x.Source.Id)).Select(x => x.Target).ToArray();
+            }
+
+            public EnvironmentResource[] GetTargetEnvironmentsForSourceNames(params string[] sourceEnvironmentNames)
+            {
+                AssertNoMissingEnvironments();
+                return sourcesAndTargets.Where(x => sourceEnvironmentNames.Contains(x.Source.Name, StringComparer.OrdinalIgnoreCase)).Select(x => x.Target).ToArray();
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTargets(params EnvironmentResource[] targets)
+            {
+                return GetSourceEnvironmentsForTargetIds(targets.Select(e => e.Id).ToArray());
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTargetIds(params string[] targetEnvironmentIds)
+            {
+                AssertNoMissingEnvironments();
+                return sourcesAndTargets.Where(x => targetEnvironmentIds.Contains(x.Target.Id)).Select(x => x.Source).ToArray();
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTargetNames(params string[] targetEnvironmentNames)
+            {
+                AssertNoMissingEnvironments();
+                return sourcesAndTargets.Where(x => targetEnvironmentNames.Contains(x.Target.Name, StringComparer.OrdinalIgnoreCase)).Select(x => x.Source).ToArray();
+            }
+
+            private void AssertNoMissingEnvironments()
+            {
+                if (MissingTargetEnvironmentNames.Any())
+                    throw new InvalidOperationException(
+                        $"The following environments are missing and should be created before expecting this map to be complete: {MissingTargetEnvironmentNames.CommaSeperate()}");
+            }
+        }
+
+        class SourceEnvironmentToTenantMap
+        {
+            private readonly SourceEnvironmentAndTenant[] sourcesAndTenants;
+
+            class SourceEnvironmentAndTenant
+            {
+                public EnvironmentResource SourceEnvironment { get; }
+                public TenantResource Tenant { get; }
+
+                public SourceEnvironmentAndTenant(EnvironmentResource sourceEnvironment, TenantResource tenant)
+                {
+                    SourceEnvironment = sourceEnvironment;
+                    Tenant = tenant;
+                }
+            }
+
+            public SourceEnvironmentToTenantMap(EnvironmentResource[] environmentsToMigrate, TenantResource[] existingTenants)
+            {
+                var expectedTenantNames = environmentsToMigrate.Select(Conventions.BuildTenantNameFromSourceEnvironment).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var tenants = existingTenants.Where(t => expectedTenantNames.Contains(t.Name, StringComparer.OrdinalIgnoreCase)).ToArray();
+                MissingTenantNames = expectedTenantNames.Except(tenants.Select(t => t.Name), StringComparer.OrdinalIgnoreCase).ToArray();
+                if (!MissingTenantNames.Any())
+                {
+                    sourcesAndTenants = environmentsToMigrate
+                        .Select(e => new SourceEnvironmentAndTenant(e, tenants.Single(t => string.Equals(t.Name, Conventions.BuildTenantNameFromSourceEnvironment(e), StringComparison.OrdinalIgnoreCase))))
+                        .ToArray();
+                }
+            }
+
+            public string[] MissingTenantNames { get; }
+
+            private void AssertNoMissingTenants()
+            {
+                if (MissingTenantNames.Any())
+                    throw new InvalidOperationException($"There are tenants that need to be created before this map can be complete: {MissingTenantNames.CommaSeperate()}");
+            }
+
+            public TenantResource[] GetAllTenants()
+            {
+                AssertNoMissingTenants();
+                return sourcesAndTenants.Select(x => x.Tenant).ToArray();
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTenants(params TenantResource[] tenants)
+            {
+                return GetSourceEnvironmentsForTenantIds(tenants.Select(t => t.Id).ToArray());
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTenantIds(params string[] tenantIds)
+            {
+                AssertNoMissingTenants();
+                return sourcesAndTenants.Where(x => tenantIds.Contains(x.Tenant.Id)).Select(x => x.SourceEnvironment).ToArray();
+            }
+
+            public EnvironmentResource[] GetSourceEnvironmentsForTenantNames(params string[] tenantNames)
+            {
+                AssertNoMissingTenants();
+                return sourcesAndTenants.Where(x => tenantNames.Contains(x.Tenant.Name, StringComparer.OrdinalIgnoreCase)).Select(x => x.SourceEnvironment).ToArray();
+            }
+
+            public TenantResource[] GetTenantsForSourceEnvironments(params EnvironmentResource[] sourceEnvironments)
+            {
+                return GetTenantsForSourceEnvironmentIds(sourceEnvironments.Select(e => e.Id).ToArray());
+            }
+
+            public TenantResource[] GetTenantsForSourceEnvironmentIds(params string[] sourceEnvironmentIds)
+            {
+                AssertNoMissingTenants();
+                return sourcesAndTenants.Where(x => sourceEnvironmentIds.Contains(x.SourceEnvironment.Id)).Select(x => x.Tenant).ToArray();
+            }
+
+            public TenantResource[] GetTenantsForSourceEnvironmentNames(params string[] sourceEnvironmentNames)
+            {
+                AssertNoMissingTenants();
+                return sourcesAndTenants.Where(x => sourceEnvironmentNames.Contains(x.SourceEnvironment.Name, StringComparer.OrdinalIgnoreCase)).Select(x => x.Tenant).ToArray();
+            }
+        }
+
+        class TenantToProjectAndTargetEnvironmentsMap
+        {
+            class TenantToProjectAndTargetEnvironments
+            {
+                public TenantToProjectAndTargetEnvironments(TenantResource tenant, ProjectResource project, EnvironmentResource[] environments)
+                {
+                    Tenant = tenant;
+                    Project = project;
+                    Environments = environments;
+                }
+
+                public TenantResource Tenant { get; }
+                public ProjectResource Project { get; }
+                public EnvironmentResource[] Environments { get; }
+            }
+
+            private readonly TenantToProjectAndTargetEnvironments[] map;
+
+            public TenantToProjectAndTargetEnvironmentsMap(IOctopusRepository repository, SourceEnvironmentToTenantMap sourceEnvironmentToTenantEnvironmentMap, SourceToTargetEnvironmentMap sourceToTargetEnvironmentMap)
+            {
+                var allProjects = repository.Projects.GetAll();
+                var allChannels = repository.Channels.FindAll();
+                var allLifecycles = repository.Lifecycles.FindAll();
+                var tenants = sourceEnvironmentToTenantEnvironmentMap.GetAllTenants();
+
+                map = allProjects.Select(project =>
+                {
+                    var projectChannels = allChannels.Where(c => c.ProjectId == project.Id);
+                    var projectChannelLifecycleIds = projectChannels.Select(c => c.LifecycleId).Where(id => id != null);
+                    var connectedLifecycleIds = new[] { project.LifecycleId }.Concat(projectChannelLifecycleIds).Distinct().ToArray();
+                    var connectedLifecycles = allLifecycles.Where(l => connectedLifecycleIds.Contains(l.Id)).ToArray();
+
+                    tenants.Select(tenant =>
+                    {
+                        // Figure out if any "environments pretending to be this tenant" were connected to this project
+                        var connectedSourceEnvironmentsForTenant = sourceEnvironmentToTenantEnvironmentMap.GetSourceEnvironmentsForTenants(tenant)
+                            .Where(source => connectedLifecycles.Any(l => LifecycleContainsAnyOfTheseEnvironments(l, source)))
+                            .ToArray();
+
+                        if (connectedSourceEnvironmentsForTenant.Any())
+                        {
+                            var targetEnvironmentsForTenant = sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSources(connectedSourceEnvironmentsForTenant);
+
+                            Log.Information("Connecting {Tenant} to {Project} deploying to {Environments}",
+                                tenant.Name, project.Name, targetEnvironmentsForTenant.Select(e => e.Name));
+                            tenant.ConnectToProjectAndEnvironments(project, targetEnvironmentsForTenant);
+                        }
+                    }
+                }
+            }
+
+            static bool LifecycleContainsAnyOfTheseEnvironments(LifecycleResource lifecycle, params EnvironmentResource[] environments)
+            {
+                return lifecycle.Phases.Any(p =>
+                    p.AutomaticDeploymentTargets.Intersect(environments.Select(e => e.Id)).Any() ||
+                    p.OptionalDeploymentTargets.Intersect(environments.Select(e => e.Id)).Any());
+            }
         }
 
         private void FillOutTenantVariablesByConvention(
@@ -443,7 +587,7 @@ namespace Octopus.TenantMigrator.Commands
             public string Alias { get; set; }
             public string DisplayName { get; set; }
 
-            public static Region[] All =
+            public static MigrateCommand.Region[] All =
             {
                 new Region("AustraliaEast", "Australia East"),
                 new Region("SoutheastAsia", "South East Asia"),
@@ -465,6 +609,20 @@ namespace Octopus.TenantMigrator.Commands
             public static class ProjectTenantVariables
             {
                 public static readonly string TenantDatabasePassword = "Tenant.Database.Password";
+            }
+        }
+
+        static class Conventions
+        {
+            public static string BuildTenantNameFromSourceEnvironment(EnvironmentResource source)
+            {
+                return source.Name.Split(new[] { '-' }, 2)[0].Trim();
+            }
+
+            public static string BuildTargetEnvironmentNameFromSourceEnvironment(EnvironmentResource source)
+            {
+                var split = source.Name.Split(new[] { '-' }, 2);
+                return split.Length == 2 ? split[1].Trim() : "Production";
             }
         }
     }
