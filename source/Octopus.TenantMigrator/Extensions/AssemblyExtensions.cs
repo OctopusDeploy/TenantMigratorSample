@@ -4,7 +4,7 @@ using System.Reflection;
 using Octopus.TenantMigrator.Infrastructure;
 
 // ReSharper disable once CheckNamespace
-namespace Octopus.TenantMigrator
+namespace Octopus.TenantMigrator.Extensions
 {
     public static class AssemblyExtensions
     {

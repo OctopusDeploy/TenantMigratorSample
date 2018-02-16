@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using Octopus.Client;
 using Octopus.Client.Editors;
 using Octopus.Client.Model;
+using Octopus.TenantMigrator.Extensions;
 using Octopus.TenantMigrator.Infrastructure;
 using Octopus.TenantMigrator.Integration;
 using Serilog;
@@ -485,26 +486,31 @@ namespace Octopus.TenantMigrator.Commands
                 {
                     var projectChannels = allChannels.Where(c => c.ProjectId == project.Id);
                     var projectChannelLifecycleIds = projectChannels.Select(c => c.LifecycleId).Where(id => id != null);
-                    var connectedLifecycleIds = new[] { project.LifecycleId }.Concat(projectChannelLifecycleIds).Distinct().ToArray();
+                    var connectedLifecycleIds = new[] {project.LifecycleId}.Concat(projectChannelLifecycleIds)
+                        .Distinct().ToArray();
                     var connectedLifecycles = allLifecycles.Where(l => connectedLifecycleIds.Contains(l.Id)).ToArray();
 
                     tenants.Select(tenant =>
                     {
                         // Figure out if any "environments pretending to be this tenant" were connected to this project
-                        var connectedSourceEnvironmentsForTenant = sourceEnvironmentToTenantEnvironmentMap.GetSourceEnvironmentsForTenants(tenant)
-                            .Where(source => connectedLifecycles.Any(l => LifecycleContainsAnyOfTheseEnvironments(l, source)))
+                        var connectedSourceEnvironmentsForTenant = sourceEnvironmentToTenantEnvironmentMap
+                            .GetSourceEnvironmentsForTenants(tenant)
+                            .Where(source => connectedLifecycles.Any(
+                                l => LifecycleContainsAnyOfTheseEnvironments(l, source)))
                             .ToArray();
 
                         if (connectedSourceEnvironmentsForTenant.Any())
                         {
-                            var targetEnvironmentsForTenant = sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSources(connectedSourceEnvironmentsForTenant);
+                            var targetEnvironmentsForTenant =
+                                sourceToTargetEnvironmentMap.GetTargetEnvironmentsForSources(
+                                    connectedSourceEnvironmentsForTenant);
 
                             Log.Information("Connecting {Tenant} to {Project} deploying to {Environments}",
                                 tenant.Name, project.Name, targetEnvironmentsForTenant.Select(e => e.Name));
                             tenant.ConnectToProjectAndEnvironments(project, targetEnvironmentsForTenant);
                         }
-                    }
-                }
+                    });
+                });
             }
 
             static bool LifecycleContainsAnyOfTheseEnvironments(LifecycleResource lifecycle, params EnvironmentResource[] environments)

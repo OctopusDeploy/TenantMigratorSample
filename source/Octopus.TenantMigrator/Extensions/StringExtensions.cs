@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 
 // ReSharper disable once CheckNamespace
-namespace Octopus.TenantMigrator
+namespace Octopus.TenantMigrator.Extensions
 {
     public static class StringExtensions
     {
